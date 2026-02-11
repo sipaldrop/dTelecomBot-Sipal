@@ -1,0 +1,9 @@
+node_modules/
+accounts.json
+.env
+tokens.json
+device_fingerprints.json
+*.log
+*.har
+config.json
+config_tmp.json
