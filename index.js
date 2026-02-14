@@ -1024,24 +1024,24 @@ async function doCheckIn(client, userId, walletAddress, ctx) {
 }
 
 // ============================================================================
-// TASK: CHECK TWEET TASK STATUS (Pre-check before posting)
+// TASK: CHECK ALL TASK STATUS (Unified pre-flight check)
 // ============================================================================
 
-async function checkTweetTaskStatus(client, userId, ctx) {
-  // Method 1: Check rule status endpoint
+async function checkAllTaskStatus(client, userId, ctx) {
+  const result = { checkInDone: false, tweetDone: false };
+
+  // Method 1: rules/status endpoint (most reliable)
   try {
     const statusRes = await client.get('/api/loyalty/rules/status', {
       params: { websiteId: WEBSITE_ID, organizationId: ORGANIZATION_ID, userId }
     });
     if (statusRes.data && statusRes.data.data) {
       for (const entry of statusRes.data.data) {
-        if (entry.loyaltyRuleId === RULE_POST_TWEET) {
-          if (entry.status === 'completed') {
-            logger.debug('Tweet task status: completed (via rules/status)', ctx);
-            return true;
-          }
-          logger.debug(`Tweet task status: ${entry.status} (via rules/status)`, ctx);
-          return false;
+        if (entry.loyaltyRuleId === RULE_CHECK_IN && entry.status === 'completed') {
+          result.checkInDone = true;
+        }
+        if (entry.loyaltyRuleId === RULE_POST_TWEET && entry.status === 'completed') {
+          result.tweetDone = true;
         }
       }
     }
@@ -1049,35 +1049,42 @@ async function checkTweetTaskStatus(client, userId, ctx) {
     logger.debug(`Rules status check failed: ${err.message}`, ctx);
   }
 
-  // Method 2: Check today's transaction entries for tweet rule
-  try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const txRes = await client.get('/api/loyalty/transaction_entries', {
-      params: {
-        limit: 50,
-        orderBy: 'createdAt',
-        websiteId: WEBSITE_ID,
-        userId,
-        organizationId: ORGANIZATION_ID,
-        loyaltyCurrencyId: LOYALTY_CURRENCY_ID,
-        hideFailedMints: true
-      }
-    });
-    if (txRes.data && txRes.data.data) {
-      for (const tx of txRes.data.data) {
-        if (tx.loyaltyRuleId === RULE_POST_TWEET && new Date(tx.createdAt) >= today) {
-          logger.debug('Tweet task status: completed (via transaction entries)', ctx);
-          return true;
+  // Method 2: fallback — check today's transaction entries
+  if (!result.checkInDone || !result.tweetDone) {
+    try {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const txRes = await client.get('/api/loyalty/transaction_entries', {
+        params: {
+          limit: 50, orderBy: 'createdAt',
+          websiteId: WEBSITE_ID, userId,
+          organizationId: ORGANIZATION_ID,
+          loyaltyCurrencyId: LOYALTY_CURRENCY_ID,
+          hideFailedMints: true
+        }
+      });
+      if (txRes.data && txRes.data.data) {
+        for (const tx of txRes.data.data) {
+          const txDate = new Date(tx.createdAt);
+          if (txDate >= today) {
+            if (tx.loyaltyRuleId === RULE_CHECK_IN) result.checkInDone = true;
+            if (tx.loyaltyRuleId === RULE_POST_TWEET) result.tweetDone = true;
+          }
         }
       }
+    } catch (err) {
+      logger.debug(`Transaction entries fallback failed: ${err.message}`, ctx);
     }
-  } catch (err) {
-    logger.debug(`Transaction entries check failed: ${err.message}`, ctx);
   }
 
-  logger.debug('Tweet task status: not completed', ctx);
-  return false;
+  logger.info(`Task status → Check-in: ${result.checkInDone ? '✅ Done' : '⏳ Pending'} | Tweet: ${result.tweetDone ? '✅ Done' : '⏳ Pending'}`, ctx);
+  return result;
+}
+
+// Backward-compatible wrapper (delegates to checkAllTaskStatus)
+async function checkTweetTaskStatus(client, userId, ctx) {
+  const status = await checkAllTaskStatus(client, userId, ctx);
+  return status.tweetDone;
 }
 
 // ============================================================================
@@ -1143,6 +1150,35 @@ async function doPostTweet(twitterClient, httpClient, userId, walletAddress, ctx
 
     if (!submitted) {
       logger.warn('Tweet posted but platform submission failed (may need Twitter linked)', ctx);
+    }
+
+    // POST-SUBMIT VERIFICATION: verify platform actually recorded the task
+    if (submitted) {
+      await humanDelay(randomBetween(5000, 10000));
+      const postCheck = await checkAllTaskStatus(httpClient, userId, ctx);
+      if (!postCheck.tweetDone) {
+        logger.warn('Tweet submitted but task not yet marked completed, re-submitting URL...', ctx);
+        // Re-try submission with all endpoints
+        for (const ep of submitEndpoints) {
+          try {
+            const retryRes = await httpClient.post(ep.url, ep.data, { headers: { 'Content-Type': 'application/json' } });
+            if (retryRes.status >= 200 && retryRes.status < 300) {
+              logger.success('Re-submission accepted!', ctx);
+              break;
+            }
+          } catch { continue; }
+        }
+        // Final verification
+        await humanDelay(randomBetween(3000, 5000));
+        const finalCheck = await checkAllTaskStatus(httpClient, userId, ctx);
+        if (!finalCheck.tweetDone) {
+          logger.warn('Task still not completed after re-submit. Tweet URL preserved for next cycle.', ctx);
+        } else {
+          logger.success('Tweet task verified as completed after re-submit ✓', ctx);
+        }
+      } else {
+        logger.success('Tweet task verified as completed ✓', ctx);
+      }
     }
 
     // Save last tweet info
@@ -1313,34 +1349,49 @@ async function runAccount(account, index) {
         await humanDelay(COOLDOWN_MINUTES * 60000 * 0.3);
       }
 
-      // ===== DAILY CHECK-IN =====
-      await humanDelay(randomBetween(3000, 8000));
-      const checkinResult = await withAuthRefresh(
-        () => doCheckIn(client, userId, walletAddress, ctx),
-        httpContext, keypair, fingerprint, ctx
-      );
-      actionCount++;
+      // ===== PRE-FLIGHT: CHECK ALL TASK STATUS =====
+      logger.task('Pre-flight check: verifying all task statuses...', ctx);
+      const taskStatus = await checkAllTaskStatus(client, userId, ctx);
 
-      // ===== CHECK TWEET STATUS FIRST (before posting to save API key) =====
+      let checkinResult = { success: false, points: 0 };
       let tweetResult = { success: false, points: 0 };
-      logger.task('Checking if tweet task already completed today...', ctx);
-      const tweetAlreadyDone = await checkTweetTaskStatus(client, userId, ctx);
-      if (tweetAlreadyDone) {
-        logger.info('Tweet task already completed today, skipping post (saving API key)', ctx);
+
+      if (taskStatus.checkInDone && taskStatus.tweetDone) {
+        // ALL tasks already completed — skip everything to avoid spam
+        logger.success('All daily tasks already completed! Skipping to stats.', ctx);
+        checkinResult = { success: true, alreadyDone: true, points: 0 };
         tweetResult = { success: true, alreadyDone: true, points: 0 };
       } else {
-        // Tweet task not completed yet — proceed to post
-        await humanDelay(randomBetween(8000, 15000));
-        tweetResult = await withAuthRefresh(
-          () => doPostTweet(twitterClient, client, userId, walletAddress, ctx),
-          httpContext, keypair, fingerprint, ctx
-        );
-        actionCount++;
+        // ===== DAILY CHECK-IN =====
+        if (!taskStatus.checkInDone) {
+          await humanDelay(randomBetween(3000, 8000));
+          checkinResult = await withAuthRefresh(
+            () => doCheckIn(client, userId, walletAddress, ctx),
+            httpContext, keypair, fingerprint, ctx
+          );
+          actionCount++;
+        } else {
+          logger.info('Check-in already done today, skipping (pre-flight)', ctx);
+          checkinResult = { success: true, alreadyDone: true, points: 0 };
+        }
 
-        // Retry on duplicate (generate new tweet content)
-        if (!tweetResult.success && tweetResult.reason === 'duplicate') {
-          await humanDelay(randomBetween(5000, 10000));
-          tweetResult = await doPostTweet(twitterClient, client, userId, walletAddress, ctx);
+        // ===== TWEET TASK =====
+        if (!taskStatus.tweetDone) {
+          await humanDelay(randomBetween(8000, 15000));
+          tweetResult = await withAuthRefresh(
+            () => doPostTweet(twitterClient, client, userId, walletAddress, ctx),
+            httpContext, keypair, fingerprint, ctx
+          );
+          actionCount++;
+
+          // Retry on duplicate (generate new tweet content)
+          if (!tweetResult.success && tweetResult.reason === 'duplicate') {
+            await humanDelay(randomBetween(5000, 10000));
+            tweetResult = await doPostTweet(twitterClient, client, userId, walletAddress, ctx);
+          }
+        } else {
+          logger.info('Tweet task already completed today, skipping (pre-flight)', ctx);
+          tweetResult = { success: true, alreadyDone: true, points: 0 };
         }
       }
 
